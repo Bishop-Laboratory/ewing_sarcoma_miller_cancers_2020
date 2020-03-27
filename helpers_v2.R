@@ -2,35 +2,85 @@
 ################################## Helper Functions ##################################
 ######################################################################################
 
+# Basic function to convert mouse to human gene names (from https://www.r-bloggers.com/converting-mouse-to-human-gene-names-with-biomart-package/)
+convertMouse2HumanGenes <- function(srtMouse, srtHuman) {
+  
+  # srtMouse <- GSE130146
+  # srtHuman <- normalCellsInt
+  
+  smMouse <- srtMouse@assays$RNA@counts
+  genesMouse <- rownames(smMouse)
+  smHuman <- srtHuman@assays$RNA@counts
+  genesHuman <- rownames(smHuman)
+  if (! file.exists("Data/mouse2HumanGenes.rda")) {
+    message("Gene conversion object not found -- querying BiomaRt...")
+    require("biomaRt")
+    human <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+    mouse <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+    mouse2HumanGenes <- getLDS(attributes = c("mgi_symbol"), 
+                      mart = mouse, attributesL = c("hgnc_symbol"),
+                      martL = human, uniqueRows=T)
+    save(mouse2HumanGenes, file = "Data/mouse2HumanGenes.rda")
+  } else {
+    load("Data/mouse2HumanGenes.rda")
+  }
+  mouse2HumanGenes <- mouse2HumanGenes[which(! duplicated(mouse2HumanGenes$MGI.symbol)),]
+  mouse2HumanGenes <- mouse2HumanGenes[which(! duplicated(mouse2HumanGenes$HGNC.symbol)),]
+  mouse2HumanGenes <- mouse2HumanGenes[mouse2HumanGenes$MGI.symbol %in% genesMouse,]
+  mouse2HumanGenes <- mouse2HumanGenes[mouse2HumanGenes$HGNC.symbol %in% genesHuman,]
+  genesMouse <- genesMouse[genesMouse %in% mouse2HumanGenes$MGI.symbol]
+  smMouse <- smMouse[genesMouse,]
+  mouse2HumanGenes2 <- mouse2HumanGenes[order(match(mouse2HumanGenes$MGI.symbol, genesMouse)),]
+  all(mouse2HumanGenes2$MGI.symbol == genesMouse)
+  rownames(smMouse) <- mouse2HumanGenes2$HGNC.symbol
+  genesHuman <- genesHuman[genesHuman %in% mouse2HumanGenes$HGNC.symbol]
+  smHuman <- smHuman[genesHuman,]
+  
+  srtMouse <- CreateSeuratObject(smMouse, meta.data = srtMouse@meta.data)  
+  srtHuman <- CreateSeuratObject(smHuman, meta.data = srtHuman@meta.data)  
+  resList <- list(
+    "srtMouse" = srtMouse,
+    "srtHuman" = srtHuman
+  )
+  return(resList)
+}
+
 # Pretty timestamp
 timestamp2 <- function() {
   # Partially from https://stackoverflow.com/questions/1962278/dealing-with-timestamps-in-r
   now <- Sys.time()
   timeList <- unclass(as.POSIXlt(now))
   secNow <- ifelse(round(timeList$sec) < 10, paste0(0, round(timeList$sec)), round(timeList$sec))
-  paste0("[", timeList$hour,":",timeList$min,":",secNow,
-      " ", (timeList$mon+1), "/", timeList$mday, "/", (timeList$year + 1900), "]", sep = "")
+  minNow <- ifelse(round(timeList$min) < 10, paste0(0, round(timeList$min)), round(timeList$min))
+  paste0("[", timeList$hour,":",minNow,":",secNow,
+         " ", (timeList$mon+1), "/", timeList$mday, "/", (timeList$year + 1900), "]", sep = "")
 }
 
-# Convenient wrapper for Trendy and GSEA
-doTrendyAnalysis <- function(countsNorm, timeVec, cores = 45) {
-  res <- trendy(Data = countsNorm, NCores = cores,
-                tVectIn = timeVec, maxK = 2)
-  resNow <- results(res)
-  res.top <- topTrendy(resNow, adjR2Cut = 0)
-  ranks <- res.top$AdjustedR2 * res.top$Segment.Trends[,c(1)]
-  names(ranks) <- names(res.top$AdjustedR2)
-  ranks <- ranks[order(ranks, decreasing = F)]
+# Convenient wrapper for GSEA and cor testing
+doTrendyAnalysis <- function(countsNorm, timeVec) {
+  
+  # timeVec <- timeNow
+  corRes <- c()
+  for (i in 1:length(countsNorm[,1])) {
+    countsNow <- countsNorm[i,]
+    corRes <- c(corRes, cor(x = countsNow, y = timeVec))
+  }
+  names(corRes) <- rownames(countsNorm)
+  r2 <- corRes^2*sign(corRes)
+  hist(r2, breaks = 100)
+  r2 <- r2[order(r2, decreasing = FALSE)]
+  # pVec <- dt(abs(corRes)/sqrt((1-corRes^2)/(n-2)), df = 2)
   pltDF <- data.frame(
-    "geneName" = names(ranks),
-    "value" = ranks,
-    "rank" = seq(1, length(ranks)),
+    "geneName" = names(r2),
+    "value" = r2,
+    "rank" = seq(1, length(r2)),
     stringsAsFactors = F
   )
-  TERM2GENE <- correlationAnalyzeR::getTERM2GENE("complex")
-  GSEARes <- correlationAnalyzeR::myGSEA(ranks, TERM2GENE)
-  GSEARes[["rankDF"]] <- pltDF
-  return(GSEARes)
+  pltDF <- pltDF[order(pltDF$rank, decreasing = T),]
+  return(pltDF)
+  # GSEARes <- myGSEA(r2, TERM2GENE, padjustedCutoff = pVal)
+  # GSEARes[["rankDF"]] <- pltDF
+  # return(GSEARes)
 }
 
 #Simple function for ranging a vector from 0 to 1
@@ -172,14 +222,79 @@ autoQCSRT <- function(srt, species = "human", whichColumn = "SRA",
 }
 
 # Convenience function to make feature plots similar to Seurat
-featurePlot2 <- function(pltData, feature, 
-                         featureType = c("column", "gene", "pathway"),
-                         reduction = "umap") {
-  require(ggpubr)
+featurePlot2 <- function(pltData, countsNorm, features, featureName = NULL,
+                         plotName,  ptSize = .4, normalize = FALSE,
+                         height = 7.5, width = 8, legend = TRUE,
+                         x, y, logNorm = FALSE, doTopCut = FALSE,
+                         pal = colorRampPalette(brewer.pal(9, "OrRd"))(255)) {
+  # pltData <- pltData
+  # countsNorm <- vsd
+  # x <- "UMAP_1"
+  # y <- "UMAP_1"
+  # normalize <- FALSE
+  # doTopCut = F
+  # logNorm = F
+  # ptSize = .4
+  # pal = colorRampPalette(brewer.pal(9, "OrRd"))(255)
+  # features <- bachMarkers
+  # signature <- upLoops
+  # pal = colorRampPalette(brewer.pal(9, "OrRd"))(255)
   
+  if (! "samples" %in% colnames(pltData)) {
+    if (! rownames(pltData) == colnames(countsNorm)) {
+      stop("Check to make sure the 'samples' column exists in pltData")
+    } else {
+      pltData$samples <- rownames(pltData)
+    }
+  }
+  countsNorm <- countsNorm[,colnames(countsNorm) %in% pltData$samples]
+  if (dim(countsNorm)[2] == 0) {
+    stop("Check to make sure the 'samples' column in pltData is equal to colnames of countData")
+  }
+  pltData <- pltData[pltData$samples %in% colnames(countsNorm),]
+  pltData <- pltData[order(match(pltData$samples, colnames(countsNorm))),]
+  if (normalize) {
+    Sizes <- MedianNorm(countsNorm)
+    countsNorm <- GetNormalizedMat(countsNorm, Sizes)
+  }
+  all(pltData$samples == colnames(countsNorm))
+  features <- features[features %in% rownames(countsNorm)]
+  pltData$plotFeat <- colMeans(countsNorm[features,, drop = F])
+  colorName <- ifelse(! is.null(featureName), featureName, ifelse(
+    length(features) > 1, "Signature\nexpression", paste0(features[1], "\nexpression")
+  ))
+  pltOrd <- pltData$plotFeat
+  pltOrd[is.na(pltOrd)] <- 0
+  pltData <- pltData[order(pltOrd, decreasing = FALSE),]
+  g1 <- ggplot(pltData, mapping = aes_string(x = x, y = y,
+                                                color = pltData$plotFeat)) +
+    geom_point(size = ptSize) + theme_pubr(border = T, base_size = 22) +
+    theme(#border = element_line(colour = "black", size = 1),
+      panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+    # scale_color_viridis(option = "B") +
+    theme(legend.position="right") +
+    rremove("legend") +
+    labs(color = colorName) +
+    scale_color_gradientn(colors = pal, na.value = "#DBDBDB")
   
+  ggsave(g1, filename = paste0("Figures_v2/", plotName, ".png"), height = height, 
+         width = width)
   
-  
+  if (legend) {
+    g1 <- ggplot(pltData, mapping = aes_string(x = x, y = y,
+                                                  color = pltData$plotFeat)) +
+      geom_point(size = ptSize) + theme_pubr(border = T, base_size = 22) +
+      theme(#border = element_line(colour = "black", size = 1),
+        panel.border = element_rect(colour = "black", fill=NA, size=1)) +
+      # scale_color_viridis(option = "B") +
+      theme(legend.position="right") +
+      # rremove("legend") +
+      labs(color = colorName) +
+      scale_color_gradientn(colors = pal, na.value = "#DBDBDB")
+    ggsave(g1, filename = paste0("Figures_v2/", plotName, "_legend.png"), height = height, 
+           width = round((width * 1.33), digits = 2))
+  }
+  return(g1)
 } 
 
 # Makes GSEA plots in the paper style
@@ -195,10 +310,10 @@ gseaPlot2 <- function(EGMT, ID, title, scoreName = "Ranking metric") {
   maxES <- gp1$data$x[which.max(abs(gp1$data$runningScore))]
   if (gp1$data$runningScore[which.max(abs(gp1$data$runningScore))] > 0) {
     limits <- c(0, (max(gp1$data$runningScore)+
-            (max(gp1$data$runningScore)*.05)))
+                      (max(gp1$data$runningScore)*.05)))
   } else {
     limits <- c((min(gp1$data$runningScore)+
-                      (min(gp1$data$runningScore)*.05)), 0)
+                   (min(gp1$data$runningScore)*.05)), 0)
   }
   gp1 <- gp1 + 
     theme_pubr(border = T, base_size = 22) + 
@@ -222,7 +337,7 @@ gseaPlot2 <- function(EGMT, ID, title, scoreName = "Ranking metric") {
 
 # Convenient wrapper for DimPlots in this publication
 DimPlot2 <- function(data, mapping, plotName, height = 7.5, width = 8,
-                     ptSize = .4,
+                     ptSize = .4, colorMap = NULL, xlab = NULL, ylab = NULL,
                      legend = TRUE, silent = TRUE) {
   g1 <- ggplot(data = data, mapping = mapping) + geom_point(size = ptSize) +
     theme_pubr(border = T, base_size = 22) +
@@ -230,7 +345,17 @@ DimPlot2 <- function(data, mapping, plotName, height = 7.5, width = 8,
     theme(legend.position="right") +
     theme(#border = element_line(colour = "black", size = 1),
       panel.border = element_rect(colour = "black", fill=NA, size=1)) + rremove("legend")
-  ggsave(g1, filename = paste0("Figures/", plotName, ".png"), height = height, 
+  if (! is.null(colorMap)) {
+    g1 <- g1 +
+      scale_color_manual(values = colorMap)
+  }
+  if (! is.null(xlab)) {
+    g1 <- g1 + xlab(xlab)
+  }
+  if (! is.null(ylab)) {
+    g1 <- g1 + ylab(ylab)
+  }
+  ggsave(g1, filename = paste0("Figures_v2/", plotName, ".png"), height = height, 
          width = width)
   if (legend) {
     g1 <- ggplot(data = data, mapping = mapping) + geom_point(size = ptSize) + theme_pubr(border = T, base_size = 22) +
@@ -238,7 +363,17 @@ DimPlot2 <- function(data, mapping, plotName, height = 7.5, width = 8,
       theme(legend.position="right") +
       theme(#border = element_line(colour = "black", size = 1),
         panel.border = element_rect(colour = "black", fill=NA, size=1))
-    ggsave(g1, filename = paste0("Figures/", plotName, "_legend.png"), height = height, 
+    if (! is.null(colorMap)) {
+      g1 <- g1 +
+        scale_color_manual(values = colorMap)
+    }
+    if (! is.null(xlab)) {
+      g1 <- g1 + xlab(xlab)
+    }
+    if (! is.null(ylab)) {
+      g1 <- g1 + ylab(ylab)
+    }
+    ggsave(g1, filename = paste0("Figures_v2/", plotName, "_legend.png"), height = height, 
            width = round((width * 1.33), digits = 2))
   }
   if (! silent) {
@@ -247,15 +382,19 @@ DimPlot2 <- function(data, mapping, plotName, height = 7.5, width = 8,
 }
 
 # Convenience function for PHATE correlation plots
-doPhateCorrPlot <- function(nameNow, resSamples) {
+doPhateCorrPlot <- function(nameNow, resSamples,
+                            intGenes = c("FANCI", "BRCA1", "CD44")) {
+  # resSamples <- resListEWS
+  # nameNow <- "PHATE_1"
+  
   phateRes <- resSamples[[nameNow]]
-  pltDF <- phateRes$rankDF
+  pltDF <- phateRes
   pltDF$gene <- ""
   m <- length(pltDF$rank)-4
   n <- max(pltDF$value)
   o <- min(pltDF$value)
-  pltDF$gene[(pltDF$geneName %in% c("FLI1", "FANCI", "BRCA1", "FEN1") |
-                pltDF$rank < 4 | pltDF$rank > m)] <-as.character(pltDF$geneName)[(pltDF$geneName %in% c("FLI1", "FANCI", "BRCA1", "FEN1")|
+  pltDF$gene[(pltDF$geneName %in% intGenes |
+                pltDF$rank < 4 | pltDF$rank > m)] <-as.character(pltDF$geneName)[(pltDF$geneName %in% intGenes|
                                                                                     pltDF$rank < 4 | pltDF$rank > m)] 
   
   
@@ -279,11 +418,99 @@ doPhateCorrPlot <- function(nameNow, resSamples) {
   return(g1)
 }
 
+doGSEABarPlot <- function(eres, topN = 5, charLimit = 50, forcePval = FALSE,
+                          colors = c("firebrick", "skyblue")) {
+  if (! forcePval) {
+    eres <- eres[eres$p.adjust < .05,]
+    if (! length(eres$ID)) {
+      warning("No significant pathways returned")
+      return(NULL)
+    }
+  }
+  
+  eresUp <- eres %>% top_n(n = topN, wt = NES)
+  eresUp <- eresUp[eresUp$NES > 0,]
+  eresUp$Group <- "Over-expressed"
+  eresDn <- eres %>% top_n(n = topN, wt = -NES)
+  eresDn <- eresDn[eresDn$NES < 0,]
+  eresDn$Group <- "Under-expressed"
+  eresPlt <- rbind(eresUp, eresDn)
+  eresPlt <- eresPlt[order(eresPlt$NES, decreasing = T),]
+  eresPlt$ID <- fixStrings(eresPlt$ID)
+  eresPlt$ID[nchar(eresPlt$ID) > charLimit] <- paste0(substr(eresPlt$ID[nchar(eresPlt$ID) > charLimit], 1, (charLimit-3)), "...")
+  eresPlt <- eresPlt[! duplicated(eresPlt$ID),]
+  eresPlt$ID <- factor(eresPlt$ID, levels = rev(eresPlt$ID))
+  g1 <- ggplot(data = eresPlt, 
+               mapping = aes_string(x = "ID", 
+                                    y = "NES", 
+                                    fill = "Group")) +
+    geom_bar(stat = "identity") + 
+    ylab("Normalized Enrichment") +
+    ggpubr::rotate() +
+    theme_pubr(border = T, base_size = 22) +
+    guides(colour = guide_legend(override.aes = list(size=3))) + 
+    theme(legend.position="right") + rremove("ylab") +
+    scale_fill_manual(values=colors) +
+    theme(axis.text.y = element_text(size = 18),
+          panel.border = element_rect(colour = "black", fill=NA, size=1)) + 
+    scale_y_continuous(expand = c(0,0), limits = c((min(eresPlt$NES)*1.1),(max(eresPlt$NES)*1.1))) +
+    rremove("legend")
+  return(g1)
+}
+
+doAltGSEA <- function(ranks, TERM2GENEList, nCharLimit = 50, nGS = 5, pCut = .05) {
+  res <- lapply(names(TERM2GENEList), FUN = function(TERM2GENENowName) {
+    TERM2GENENow <- TERM2GENEList[[TERM2GENENowName]]
+    GSEARes <- myGSEA(ranks = ranks, TERM2GENE = TERM2GENENow, padjustedCutoff = pCut)
+    list("gseaPlot" = (doGSEABarPlot(GSEARes$eres, charLimit = nCharLimit, topN = nGS, colors = c("#525252", "#BDBDBD")) +
+                         labs(title = TERM2GENENowName)),
+         "eres" = GSEARes$eres)
+  })
+  names(res) <- names(TERM2GENEList)
+  return(res)  
+}
+
+# Taken from https://github.com/cran/VennDiagram/blob/master/R/hypergeometric.test.R
+#This function performs the hypergeometric test on the two categories. Taken from package BoutrosLab.statistics.general
+calculate.overlap.and.pvalue = function(list1, list2, total.size, lower.tail = TRUE, adjust = FALSE) {
+  
+  # calculate actual overlap
+  actual.overlap <- length(intersect(list1, list2));
+  
+  # calculate expected overlap
+  # need to cast to avoid integer overflow when length(list1) * length(list2) is extremely large
+  expected.overlap <- as.numeric(length(list1)) * length(list2) / total.size;
+  
+  adjust.value <- 0;
+  
+  # adjust actual.overlap to reflect P[X >= x]
+  if (adjust & !lower.tail) {
+    adjust.value <- 1;
+    warning('Calculating P[X >= x]');
+  }
+  
+  # calculate significance of the overlap
+  overlap.pvalue <- phyper(
+    q = actual.overlap - adjust.value,
+    m = length(list1),
+    n = total.size - length(list1),
+    k = length(list2),
+    lower.tail = lower.tail
+  );
+  
+  # return values
+  return( c(actual.overlap, expected.overlap, overlap.pvalue) );
+  
+}
+
+
+
 # Convenience wrapper for msigdbr
 getTERM2GENE <- function(GSEA_Type = c("simple"),
                          Species = c("hsapiens", "mmusculus"),
                          sampler = FALSE) {
-  
+  # require(dplyr)
+  # require(tidyr)
   # Species = "hsapiens"
   # GSEA_Type = "simple"
   # sampler = FALSE
@@ -329,9 +556,8 @@ getTERM2GENE <- function(GSEA_Type = c("simple"),
   }
   categories <- unique(c(categories, GSEA_Type))
   TERM2GENE <- MDF %>%
-    filter(.data$gs_cat %in% categories) %>%
-    select(.data$gs_name, .data$gene_symbol)
-  
+    dplyr::filter(.data$gs_cat %in% categories) %>%
+    dplyr::select(.data$gs_name, .data$gene_symbol)
   
   if (sampler) {
     print("Using sampler!")
@@ -341,100 +567,7 @@ getTERM2GENE <- function(GSEA_Type = c("simple"),
   return(TERM2GENE)
 }
 
-# Convenience wrapper for making supplemental cluster marker plots
-doClusterMarkerPlot <- function(srt, srtMarkers, outName) {
-  # # Bug testing
-  # srt <- BDInt
-  # srtMarkers <- BDIntMarkers
-  # outName = "Figures/Fig1Cxiii"
-  
-  dir.create(paste0("Figures/", outName), showWarnings = F)
-  srtMarkers <- srtMarkers[srtMarkers$p_val_adj < .05,]
-  srtMarkers$p_val_adj[srtMarkers$p_val_adj == 0] <- .Machine$double.xmin
-  clusterList <- unique(as.numeric(srt$seurat_clusters))
-  clusterList <- c(0, clusterList[order(clusterList)])
-  names(clusterList) <- paste0("Cluster: ", clusterList)
-  pltDat <- srt@meta.data
-  pltDat$UMAP_1 <- srt@reductions$umap@cell.embeddings[,c(1)]
-  pltDat$UMAP_2 <- srt@reductions$umap@cell.embeddings[,c(2)]
-  TERM2GENE <- correlationAnalyzeR::getTERM2GENE(GSEA_Type = "simple")
-  for (i in 1:length(clusterList)) {
-    clusterName <- names(clusterList)[i]
-    print(clusterName)
-    clusterNow <- clusterList[clusterName]
-    pltDat$Selected <- FALSE
-    pltDat$Selected[pltDat$seurat_clusters == clusterNow] <- TRUE
-    pltDat$Selected <- factor( pltDat$Selected, levels = c(TRUE, FALSE))
-    pltDat <- pltDat[order(pltDat$Selected, decreasing = TRUE),]
-    g1 <- ggplot(data = pltDat, mapping = aes_string(x = "UMAP_1",
-                                                     y = "UMAP_2",
-                                                     color = "Selected")) + 
-      geom_point(size = .6) + theme_pubr(border = T, base_size = 22) +
-      guides(colour = guide_legend(override.aes = list(size=3))) + 
-      theme(legend.position="right") +
-      labs(title = clusterName) +
-      theme(#border = element_line(colour = "black", size = 1),
-        panel.border = element_rect(colour = "black", fill=NA, size=1)) + 
-      scale_color_manual(values=c("#CC0909", "#C4BFBF")) +
-      rremove("legend")
-    wordData <- srtMarkers[srtMarkers$cluster == clusterNow,]
-    wordData <- data.frame(
-      "word" = wordData$gene,
-      "freq" = -log10(wordData$p_val_adj) * sign(wordData$avg_logFC),
-      stringsAsFactors = FALSE
-    )
-    posCloud <- wordData[wordData$freq > 0,]
-    posCloud <- posCloud %>% top_n(n = 6, wt = freq)
-    negCloud <- wordData[wordData$freq < 0,]
-    negCloud$freq <- -1*(negCloud$freq)
-    negCloud <- negCloud %>% top_n(n = 6, wt = freq)
-    if (! length(posCloud$word) | ! length(negCloud$word)) {
-      warning("Not enough markers for cluster ", clusterNow)
-      next
-    }
-    pal <-  colorRampPalette(brewer.pal(9,"Reds"))(length(posCloud$word))
-    plot.new()
-    dev.off()
-    posCloud <- posCloud[order(posCloud$freq, decreasing = T),]
-    posCloud$freq <- order(posCloud$freq, decreasing = F)
-    wordcloud(words = posCloud$word, max.words = 6,
-              random.order = F,  scale=c(2.5,.1),
-              fixed.asp = T, rot.per = 0,
-              freq = posCloud$freq, colors = pal)
-    gridGraphics::grid.echo()
-    pt <- grid.grab()
-    g2 <- as.ggplot(pt)
-    dev.off()
-    pal <-  colorRampPalette(brewer.pal(9,"Greys"))(length(negCloud$word))
-    plot.new()
-    dev.off()
-    negCloud <- negCloud[order(negCloud$freq, decreasing = T),]
-    negCloud$freq <- order(negCloud$freq, decreasing = F)
-    wordcloud(words = negCloud$word, max.words = 6,
-              random.order = F, scale=c(2.5,.1),
-              rot.per = 0, fixed.asp = T,
-              freq = negCloud$freq, colors = pal)
-    gridGraphics::grid.echo()
-    pt <- grid.grab()
-    g3 <- as.ggplot(pt)
-    dev.off()
-    
-    # Pathway plots
-    posGenes <- wordData$word[wordData$freq > 0]
-    negGenes <- wordData$word[wordData$freq < 0]
-    g4 <- doPathEnrichPlot(posGenes, negGenes, 
-                           TERM2GENE = TERM2GENE)
-    
-    # Arrange
-    ggNow <- ggdraw() +
-      draw_plot(g1, x = 0, y = .4, width = .4, height = .6) +
-      draw_plot(g2, x = 0, y = 0, width = .2, height = .35) +
-      draw_plot(g3, x = 0.25, y = 0, width = .2, height = .35) +
-      draw_plot(g4, x = 0.47, y = 0, width = .53, height = 1) 
-    ggsave(ggNow, file = paste0("Figures/", outName, "/Cluster_", clusterNow, ".png"),
-           height = 9, width = 16)
-  }
-}
+
 
 # Makes gene set IDs presentable for publications
 fixStrings <- function(StringVec) {
@@ -457,6 +590,18 @@ fixStrings <- function(StringVec) {
   #                "GGGNNTTTCC_NFKB_Q6_01",
   #                "AAAYWAACM_HFH4_01",
   #                "KANG_DOXORUBICIN_RESISTANCE_UP")
+  # StringVec <- "IGLESIAS_E2F_TARGETS_UP"
+  
+  # These SILIGAN genesets are inverted... 
+  StringVec <- gsub(StringVec, pattern = "SILIGAN_TARGETS_OF_EWS_FLI1_FUSION_DN",
+                    replacement = "SILIGAN_TARGETS_OF_EWS_FLI1_FUSION_DN_(UP)")
+  StringVec <- gsub(StringVec, pattern = "SILIGAN_TARGETS_OF_EWS_FLI1_FUSION_UP",
+                    replacement = "SILIGAN_TARGETS_OF_EWS_FLI1_FUSION_UP_(DN)")
+  # So are the IGLESIAS... 
+  StringVec <- gsub(StringVec, pattern = "IGLESIAS_E2F_TARGETS_UP",
+                    replacement = "IGLESIAS_E2F_TARGETS_UP_(DN)")
+  StringVec <- gsub(StringVec, pattern = "IGLESIAS_E2F_TARGETS_DN",
+                    replacement = "IGLESIAS_E2F_TARGETS_UP_(UP)")
   
   StringVec <- gsub(StringVec, pattern = "_", replacement = " ")
   StringVec <- tolower(StringVec)
@@ -497,6 +642,8 @@ fixStrings <- function(StringVec) {
   StringVec <- gsub(StringVec, pattern = " Gc ", replacement = " GC ", ignore.case = FALSE)
   StringVec <- gsub(StringVec, pattern = " Hdl ", replacement = " HDL ", ignore.case = FALSE)
   StringVec <- gsub(StringVec, pattern = " Dn$", replacement = " Down", ignore.case = FALSE)
+  StringVec <- gsub(StringVec, pattern = " Dn \\(", replacement = " Down (", ignore.case = FALSE)
+  StringVec <- gsub(StringVec, pattern = "\\(Dn\\)", replacement = "(Down)", ignore.case = FALSE)
   StringVec <- gsub(StringVec, pattern = " Ldl ", replacement = " LDL ", ignore.case = FALSE)
   StringVec <- gsub(StringVec, pattern = " Tcr ", replacement = " TCR ", ignore.case = FALSE)
   StringVec <- gsub(StringVec, pattern = " Mdc ", replacement = " MDC ", ignore.case = FALSE)
@@ -614,31 +761,33 @@ fixStrings <- function(StringVec) {
                     replacement = "\\1\\U\\2", ignore.case = FALSE)
   StringVec <- gsub(StringVec, pattern = "(B)(i+) ", perl = TRUE,
                     replacement = "\\1\\U\\2 ", ignore.case = FALSE)
-  
+  StringVec <- gsub(StringVec, pattern = "IgLesias", perl = TRUE,
+                    replacement = "Iglesias", ignore.case = FALSE)
   return(StringVec)
 }
 
 # Convenience wrapper for creating pathway enrichment plots
-doPathEnrichPlot <- function(genesUp, genesDn, TERM2GENE, topN = 6) {
+doPathEnrichPlot <- function(genesUp, genesDn, TERM2GENE, returnData = FALSE, ncharLimit = 50,
+                             topN = 6, colors = c("#CC0909", "#C4BFBF")) {
   # genesUp <- posGenes
   # genesDn <- negGenes
   # topN = 6
   
   EGMT <- enricher(gene = genesUp, TERM2GENE = TERM2GENE)
-  eresUp <- as.data.frame(EGMT)
-  if (! length(eresUp$ID)) {
+  eresUpRaw <- as.data.frame(EGMT)
+  if (! length(eresUpRaw$ID)) {
     EGMT <- enricher(gene = genesUp, TERM2GENE = TERM2GENE, pvalueCutoff = .3)
-    eresUp <- as.data.frame(EGMT)
+    eresUpRaw <- as.data.frame(EGMT)
   }
   EGMT <- enricher(gene = genesDn, TERM2GENE = TERM2GENE)
-  eresDn <- as.data.frame(EGMT)
-  if (! length(eresDn$ID)) {
+  eresDnRaw <- as.data.frame(EGMT)
+  if (! length(eresDnRaw$ID)) {
     EGMT <- enricher(gene = genesDn, TERM2GENE = TERM2GENE, pvalueCutoff = .3)
-    eresDn <- as.data.frame(EGMT)
+    eresDnRaw <- as.data.frame(EGMT)
   }
-  eresDnIDs <- eresDn$ID
-  eresDn <- eresDn[! eresDn$ID %in% eresUp$ID,]
-  eresUp <- eresUp[! eresUp$ID %in% eresDnIDs,]
+  eresDnIDs <- eresDnRaw$ID
+  eresDn <- eresDnRaw[! eresDnRaw$ID %in% eresUpRaw$ID,]
+  eresUp <- eresUpRaw[! eresUpRaw$ID %in% eresDnIDs,]
   eresUp <- eresUp %>% top_n(n = topN, wt = -p.adjust)
   eresUp$Group <- "Over-expressed"
   eresUp <- eresUp[order(eresUp$p.adjust),]
@@ -648,25 +797,33 @@ doPathEnrichPlot <- function(genesUp, genesDn, TERM2GENE, topN = 6) {
   pltDF <- rbind(eresUp[,c(1, 6, 10)], eresDn[,c(1, 6, 10)])
   pltDF$p.adjust <- -log10(pltDF$p.adjust)
   pltDF$EnrichmentScore <- pltDF$p.adjust
-  pltDF$ID <- correlationAnalyzeR::fixStrings(pltDF$ID)
-  pltDF$ID[nchar(pltDF$ID) > 40] <- paste0(substr(pltDF$ID[nchar(pltDF$ID) > 40], 1, 37), "...")
+  pltDF$ID <- fixStrings(pltDF$ID)
+  pltDF$ID[nchar(pltDF$ID) > ncharLimit] <- paste0(substr(pltDF$ID[nchar(pltDF$ID) > ncharLimit], 1, (ncharLimit - 3)), "...")
   pltDF <- pltDF[! duplicated(pltDF$ID),]
   pltDF$ID <- factor(pltDF$ID, levels = rev(pltDF$ID))
-  return(ggplot(data = pltDF, 
-                mapping = aes_string(x = "ID", 
-                                     y = "EnrichmentScore", 
-                                     fill = "Group")) +
-           geom_bar(stat = "identity") + 
-           ylab("-log10(pAdj)") +
-           ggpubr::rotate() +
-           theme_pubr(border = T, base_size = 22) +
-           guides(colour = guide_legend(override.aes = list(size=3))) + 
-           theme(legend.position="right") + rremove("ylab") +
-           scale_fill_manual(values=c("#CC0909", "#C4BFBF")) +
-           theme(axis.text.y = element_text(size = 18),
-                 panel.border = element_rect(colour = "black", fill=NA, size=1)) + 
-           scale_y_continuous(expand = c(0,0), limits = c(0,(max(pltDF$EnrichmentScore)*1.1))) +
-           rremove("legend"))
+  g1 <- ggplot(data = pltDF, 
+               mapping = aes_string(x = "ID", 
+                                    y = "EnrichmentScore", 
+                                    fill = "Group")) +
+    geom_bar(stat = "identity") + 
+    ylab("-log10(pAdj)") +
+    ggpubr::rotate() +
+    theme_pubr(border = T, base_size = 22) +
+    guides(colour = guide_legend(override.aes = list(size=3))) + 
+    theme(legend.position="right") + rremove("ylab") +
+    scale_fill_manual(values=colors) +
+    theme(axis.text.y = element_text(size = 18),
+          panel.border = element_rect(colour = "black", fill=NA, size=1)) + 
+    scale_y_continuous(expand = c(0,0), limits = c(0,(max(pltDF$EnrichmentScore)*1.1))) +
+    rremove("legend")
+  if (! returnData) {
+    return(g1)
+  } else {
+    return(list("plot" = g1,
+                "eresUp" = eresUpRaw,
+                "eresDn" = eresDnRaw))
+  }
+  
 }
 
 # Convenience wrapper for GSEA
@@ -855,8 +1012,9 @@ GSEA2 <- function(TERM2GENE, ranks,
     nproc = parallel::detectCores()
   }
   TERMList <- TERM2GENE %>% split(x = .$gene_symbol, f = .$gs_name)
+  set.seed(42)
   EGMT <- fgsea::fgsea(pathways = TERMList, nproc = nproc,
-                       maxSize = 500,
+                       maxSize = 500, 
                        minSize = 15,
                        stats = ranks, nperm = nperm)
   res <- data.frame(
@@ -896,3 +1054,286 @@ GSEA2 <- function(TERM2GENE, ranks,
   EGMT@keytype <- "UNKNOWN"
   return(EGMT)
 }
+
+
+# Convenience wrapper for making supplemental cluster marker plots
+doClusterMarkerPlot <- function(srt, srtMarkers, outName, ncharLimit = 50,
+                                intClust = NULL, topN = 6,
+                                TERM2GENE = NULL) {
+  # # Bug testing
+  # srt <- BDInt
+  # srtMarkers <- BDIntMarkers
+  # outName = "Figures_v2/Fig1Cx0iii"
+  
+  if (is.null(TERM2GENE)) {
+    TERM2GENE <- getTERM2GENE(GSEA_Type = "simple")
+  }
+  
+  dir.create(paste0("Figures_v2/", outName), showWarnings = F)
+  srtMarkers <- srtMarkers[srtMarkers$p_val_adj < .05,]
+  srtMarkers$p_val_adj[srtMarkers$p_val_adj == 0] <- .Machine$double.xmin
+  clusterList <- unique(as.numeric(srt$seurat_clusters))
+  clusterList <- c(0, clusterList[order(clusterList)])
+  names(clusterList) <- paste0("Cluster: ", clusterList)
+  pltDat <- srt@meta.data
+  pltDat$UMAP_1 <- srt@reductions$umap@cell.embeddings[,c(1)]
+  pltDat$UMAP_2 <- srt@reductions$umap@cell.embeddings[,c(2)]
+  for (i in 1:length(clusterList)) {
+    if (! is.null(intClust)) {
+      if (! i %in% (intClust+1)) {
+        next
+      }
+    }
+    clusterName <- names(clusterList)[i]
+    print(clusterName)
+    clusterNow <- clusterList[clusterName]
+    pltDat$Selected <- FALSE
+    pltDat$Selected[pltDat$seurat_clusters == clusterNow] <- TRUE
+    pltDat$Selected <- factor( pltDat$Selected, levels = c(TRUE, FALSE))
+    pltDat <- pltDat[order(pltDat$Selected, decreasing = TRUE),]
+    g1 <- ggplot(data = pltDat, mapping = aes_string(x = "UMAP_1",
+                                                     y = "UMAP_2",
+                                                     color = "Selected")) + 
+      geom_point(size = .6) + theme_pubr(border = T, base_size = 22) +
+      guides(colour = guide_legend(override.aes = list(size=3))) + 
+      theme(legend.position="right") +
+      labs(title = clusterName) +
+      theme(#border = element_line(colour = "black", size = 1),
+        panel.border = element_rect(colour = "black", fill=NA, size=1)) + 
+      scale_color_manual(values=c("#CC0909", "#C4BFBF")) +
+      rremove("legend")
+    wordData <- srtMarkers[srtMarkers$cluster == clusterNow,]
+    wordData <- data.frame(
+      "word" = wordData$gene,
+      "freq" = -log10(wordData$p_val_adj) * sign(wordData$avg_logFC),
+      stringsAsFactors = FALSE
+    )
+    posCloud <- wordData[wordData$freq > 0,]
+    posCloud <- posCloud %>% top_n(n = 6, wt = freq)
+    negCloud <- wordData[wordData$freq < 0,]
+    negCloud$freq <- -1*(negCloud$freq)
+    negCloud <- negCloud %>% top_n(n = 6, wt = freq)
+    if (! length(posCloud$word) | ! length(negCloud$word)) {
+      warning("Not enough markers for cluster ", clusterNow)
+      next
+    }
+    pal <-  colorRampPalette(brewer.pal(9,"Reds"))(length(posCloud$word))
+    plot.new()
+    dev.off()
+    posCloud <- posCloud[order(posCloud$freq, decreasing = T),]
+    posCloud$freq <- order(posCloud$freq, decreasing = F)
+    wordcloud(words = posCloud$word, max.words = 6,
+              random.order = F,  scale=c(2.5,.1),
+              fixed.asp = T, rot.per = 0, mar = c(0,0,0,0),
+              freq = posCloud$freq, colors = pal)
+    
+    gridGraphics::grid.echo()
+    pt <- grid.grab()
+    g2 <- as.ggplot(pt)
+    dev.off()
+    pal <-  colorRampPalette(brewer.pal(9,"Greys"))(length(negCloud$word))
+    plot.new()
+    dev.off()
+    negCloud <- negCloud[order(negCloud$freq, decreasing = T),]
+    negCloud$freq <- order(negCloud$freq, decreasing = F)
+    
+    
+    wordcloud(words = negCloud$word, max.words = 6,
+               random.order = F, scale=c(2.5,.1),
+               rot.per = 0, fixed.asp = T,
+               freq = negCloud$freq, colors = pal)
+    gridGraphics::grid.echo()
+    pt <- grid.grab()
+    g3 <- as.ggplot(pt)
+    dev.off()
+    # Pathway plots
+    posGenes <- wordData$word[wordData$freq > 0]
+    negGenes <- wordData$word[wordData$freq < 0]
+    g4 <- doPathEnrichPlot(posGenes, negGenes, topN = topN, ncharLimit = ncharLimit, 
+                           TERM2GENE = TERM2GENE)
+    # Arrange
+    ggNow <- ggdraw() +
+      draw_plot(g1, x = 0, y = .4, width = .4, height = .6) +
+      draw_plot(g2, x = 0, y = 0, width = .2, height = .35) +
+      draw_plot(g3, x = 0.25, y = 0, width = .2, height = .35) +
+      draw_plot(g4, x = 0.47, y = 0, width = .53, height = 1) 
+    ggsave(ggNow, file = paste0("Figures_v2/", outName, "/Cluster_", clusterNow, ".png"),
+           height = 9, width = 16)
+  }
+}
+
+
+# Tissue dict
+tissueDict <- list("brain" = list("yes" = c("cortex", "brain", "lobe", "hippoc", "^pfc$", "mge",
+                                            "^vc$", "^cbc$", "gyrus", "stroke", "sciencell",
+                                            "alzheim", "frontal", "dentate", "white matter", "brian",
+                                            "cranial",
+                                            "grey matter", "gray matter", "striatum", "pericyte",
+                                            "nerv", "gangli", "bipol", "medull", "putamen",
+                                            "hippocamp", "neur", "glia", "amygdala", "oligodendro",
+                                            "spine", "spinal", "astrocyt", "cereb"),
+                                  "no" = c("liver", "kidney", "microgli", "aneurysm", "vessel",
+                                           "precursor", 'progenitor', "stem cell", "Neuroectodermal",
+                                           "iPSC", "NPC", "NSC")),
+                   "thyroid" = c("thyroid"),
+                   "respiratory" = c("lung", "airway", "nasal", "hsaec",
+                                     "trach", "pleura", "alveol", "bronch"),
+                   "skin" = c("skin", "keratin", "dermis", "^dk$", "epidermis", "melano", "psoriasis"),
+                   "pancreas" = list("yes" = c("pancreas", "pancrea", 
+                                               "islet", "alpha", "beta", "delta", "epsilon"),
+                                     "no" = c("falpha", "fbeta")),
+                   "kidney" = list("yes" = c("kidney", "nephr", "glomerul", 
+                                             "renal", "clear cell", "^ptec$"),
+                                   "no" = c("ASDLJSND")),
+                   "fetal" = c("placent", "fetal", "huvec", "decidua", "germ",
+                               "fetus", "embry", "umbil", "cord blood"),
+                   "cartilage" = c("cartilag", "chondr", "joint"),
+                   "mammary" = list("yes" = c("mammary", "breast", "imec", "hmec",
+                                              "reduction mammoplasty no known cancer"),
+                                    "no" = c("ASDLKNASDL")),
+                   "stomach"= c("stomach", "gastric"),
+                   "esophagus" = c("esophag"),
+                   "intestines" = list("yes" = c("intestine", "intestinal", "colon", "duoden", "colorect",
+                                                 "ileum", "ileal", "gut", "bowel", "jejun", "sigmoid",
+                                                 "recto", "ileocolic"),
+                                       "no" = c("colonization", "human colorectal cell line", 
+                                                "ncm356d")),
+                   "muscle" = list("yes" = c("muscle", "myo",  "^smc", " smc",
+                                             "lateralis", "gastrocnemius",
+                                             "skeletal", "brach", "satellite", "ceps"), 
+                                   "no" = c("cardiac", 'heart', "endothel", "vessel")),
+                   "liver" = list("yes" = c("liver", "hepat", "kupffer", "phh"),
+                                  "no" = c("deliver")),
+                   "adipose" = list(
+                     "yes" = c("adipose", "fat", "adipo", "^wat$", "^bat$"),
+                     "no" = c("mesenchymal", "milk", "adipocyterna", "hdfatprx1")
+                   ),
+                   "stem-like" = list("yes" = c("stem", "progen", "prog$", "blast ", 
+                                                "hesc", "hues64", "blast$",
+                                                "cd34", "cord blood", "wharton", "pluripotent",
+                                                "ncsc", "ncc", "hnspc", "^kp$", "ECFC",
+                                                "npc", "h1esc", "^h1", " pes[0-9]+", "hff",
+                                                "embryo", "ectoderm", "epsc", "morula",
+                                                "mesoderm", "^ips$", "hpsc", "hfl1", "HSPC",
+                                                "dental pulp cells", "cpcs", "fbs", "primitive",
+                                                "[a-zA-Z]genic", "hematopoietic", "^esc$",
+                                                "human es", "human ips", "endoderm", "sscs",
+                                                "human icm", "human te", "derma", "^esc$",
+                                                "NAMEC", "mesenchym", "hffs", "hmsc",
+                                                "h9", "controlc7", "stroma", "msc", "zygote",
+                                                "fibroblas", "IMR90", "hff1", "nhdf",
+                                                "npsc", "ipsc", "poetic", "ips cell", "satellite"),
+                                      "no" = c("dermal")),
+                   "cardiac" = list("yes" = c("cardiac", "heart", 
+                                              "atria", "atrium",
+                                              "coron", "aort", "ventric"),
+                                    "no" = c("SADONASDIOFN")),
+                   "endothelial" = list("yes" = c("endoth", "huvec", "hdmec", "ECFC",
+                                                  "vascul", "vessel","f[0-9]ecs",
+                                                  "hpmec", "ecctr", "ectnf", "ecil"),
+                                        "no" = c("ASDKFBASD")),
+                   "spleen" = c("spleen", "splen"),
+                   "bladder" = list("yes" = c("bladder", "urin", "urothe"),
+                                    "no" = c("during")),
+                   "retina" = c("retina", "macular", "retin", "photo"),
+                   "thymus" = c("thymus", "thymic"),
+                   "male reproductive" = list("yes" = c("testis", "testes", 
+                                                        "leydig", "peritubular", "sertoli",
+                                                        "cauda", "corpus", "caput",
+                                                        "testicle", "sperm",
+                                                        "epidid", "gonad"),
+                                              "no" = c("prostate", "prostatic")),
+                   "prostate" = list("yes" = c("prostate", "prostatic"),
+                                     "no" = c("ASODINASD")),
+                   "female reproductive" = list("yes" = c("ovar",  "amniotic", 
+                                                          "uter", "placent", "fallopian",
+                                                          "deciduo", "cervix", "amnion", "chorionic villus",
+                                                          "endometri", "oviductal",
+                                                          "cervic", "vagi", "granulosa"),
+                                                "no" = c("stroma")),
+                   "immune" = list("yes" = c("immune", "macroph", "leuk",
+                                             "killer", "lymph",
+                                             "cd[0-9]+",
+                                             "NKT", "blood", "microgli", "gm12878", "tcell", "bcell",
+                                             "b cell", "t cell", "cd4", "cd8", "nk cell",
+                                             "monocyt", "dendrit", "granulocyt",
+                                             "lympho", "mononucle", "pbmc", "neutro", "treg"),
+                                   "no" = c("ctc", "stroma", "osteo", "vein",
+                                            "vessel", "cord", "oma", "cd34",
+                                            "[a-zA-Z]b cell", "[a-zA-Z]t cell")),
+                   "bone" = list("yes" = c("femur", "osteo", "hfob",
+                                           "mandible", "bone", "joint"),
+                                 "no" = c("MSC")),
+                   "ewing sarcoma" = list("yes" = c("ewing", "a673", "$tc[0-9]+",
+                                                    " tc[0-9]+", "ews", "ews502",
+                                                    "chla[0-9]+", "TC32",
+                                                    "tc71", "sknmc", 
+                                                    "rd-es", "sk-es", 
+                                                    "skes", "sk-nm-c",
+                                                    "cadoes", "^rdes$",
+                                                    "^rdes ",
+                                                    "^rdes_", " es2 ",
+                                                    "^es2 ", " es2$",
+                                                    "ew[0-9]+", "es7"),
+                                          "no" = c("pES", "RUES", "HUES", 
+                                                   "PES1", "hes", "CSES7", 
+                                                   "A375", "786", "TTC1240", "TTC642",
+                                                   "hela", "HepG2", "k562", "RWPE1", "aES7")),
+                   "neural crest cells" = list("yes" = c("ncc", "ncsc"),
+                                               "no" = c("NCCIT", "NCC24")),
+                   "HSCs" = list("yes" = c("HSC", "hematopoeitic stem", "cd34"),
+                                 "no" = c('hepatic', "shScramble")),
+                   "MSCs" = list("yes" = c("MSC", "mesenchymal", "mesenchymal"),
+                                 "no" = c("UMSCC", "pMSCV")),
+                   "tumor" = list("yes" = c("cancer", "carcin", "sarcom", "metasta", "tumor",
+                                            "[a-zA-Z]oma ", "[a-zA-Z]oma$"),
+                                  "no" = c("healthy", "normal", "stroma")),
+                   "Neural progenitor/stem cells" = c("NPC", "NSC", "npsc", "pMN progenitor",
+                                                      "hnspc", "Neuron Precursor", "neural precursor"),
+                   "hESCs" = list("yes" = c("hesc", "^esc$", "^h9$", " h9 ", 
+                                            " h9$", "^h9 ", "h1esc",
+                                            "pES[0-9]+","HUES[0-9]+", "embyonic", 
+                                            "human es", "^h1", "embryonic stem"),
+                                  "no" = c("derived", "NPC", "MSC")),
+                   "iPSCs" = list("yes" = c("iPSC", "ips cell", "^ips$","hiPS",
+                                            "human ips", "hpsc", "pluripotent stem", "Induced pluripotent"),
+                                  "no" = c("iPSC-derived", "NPC", "MSC", "ips derived", "ipsc derived",
+                                           "ips-derived")),
+                   "Other stem-cells" = c("pscs", "cpcs", 
+                                          "dental pulp", "periodontal ligament stem"),
+                   "Other prenatal tissues" = list("yes" = c("parthenogenic", "blastoycst", "trophoblast",
+                                                             "zygote", "endoderm", "morula", "oocyte", "Umbilical",
+                                                             " ICM$", " te$", "oocy", "oophorus", 
+                                                             "hek293", "hek 293", " 293T$", "^293T ",
+                                                             " 293$", "^293 ",
+                                                             "primitive streak", "fetal", "Germinal",
+                                                             "Embryo", "Fetus","mesoderm","ectoderm", "endometrial stroma"),
+                                                   "no" = c("cord blood")),
+                   "fibroblasts" = c("hff1", "HFF-1", "nhdf", "^derma$",
+                                     "fibroblas", "IMR90", "HFF", "fbs"),
+                   "Non-Ewing tumor" = list("yes" = c("cancer", "[a-z]oma", "hela", "metast",
+                                                      "mdamd231", "^rt[0-9]+", "g401", "Soft Tissue, Mesenchymal",
+                                                      "tumor", "hec1b", "^omental tissue$", "HNSCC", "HCC",
+                                                      "hela", "k562", "reh", "jurkat", "leukemi", "293", "bewo",
+                                                      "kras", "mcf", "lncap", "bjab", "gbm", " aml",
+                                                      "rko", "ramos", "mel888", "aml ",
+                                                      "vcap", "saos2", "vapc", "nalm6", "set2", "tov21",
+                                                      "cancer", "carcin", "sarcom", "metasta", "tumor",
+                                                      "[a-zA-Z]oma ", "[a-zA-Z]oma$", "NCCIT",
+                                                      "panc1", "mcf7", "pc3"),
+                                            "no" = c("healthy", "normal","ewing", "a673", 
+                                                     "tc32", "ews", "ews502", "es2",
+                                                     "chla", "tc71", "sknmc", 
+                                                     "SK-NM-C", "SK-ES",
+                                                     "cadoes", "^rdes$",
+                                                     "^rdes_", "stroma",
+                                                     "ew[0-9]+", "es7")),
+                   "SingleCell" = c("single cell", "single-cell", "smart seq", "in-drop",
+                                    "cel-seq", "10X", "scRNA seq", "smartseq", "CELseq",
+                                    "smart-seq", "indrop", "drop-seq", "drop seq", "single nucleus",
+                                    "single-nucleus", "snRNA-Seq", "snRNASeq",
+                                    "fluidigm", "scRNASeq", "scRNA-Seq", "chromium"))
+
+jsonlite::write_json(x = tissueDict, path = "Data/bulkRNASeq/tissueDictionary.json")
+
+
