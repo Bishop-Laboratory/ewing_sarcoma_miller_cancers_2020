@@ -23,8 +23,8 @@
 #####################################################################################
 #####################################################################################
 
-cat("\nRunning figure generation script for Miller et al. 2020\n")
-source("helpers_v2.R") 
+cat("\nReproducing analysis from Miller et al. 2020\n")
+source("helpers_v2.R")
 
 #####################################################################################
 ############################ Preliminary: Load libraries ############################ 
@@ -37,6 +37,9 @@ suppressMessages(library(DESeq2))
 suppressMessages(library(cowplot))
 suppressMessages(library(uwot))
 suppressMessages(library(biomaRt))
+if (! "phateR" %in% installed.packages()[,1]) {
+  install.packages("phateR", repos = "https://cloud.r-project.org/")
+}
 suppressMessages(library(phateR))
 suppressMessages(library(tidyr))
 suppressMessages(library(stringr))
