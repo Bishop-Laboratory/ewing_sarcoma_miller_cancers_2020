@@ -510,6 +510,8 @@ if (! file.exists("Data/bulkRNASeq/pltDataUMAP_Fig1.rda")) {
                           ewsMarkerGenes$p_val_adj < 1E-50] <- TRUE
   doMarksDF <- ewsMarkerGenes[ewsMarkerGenes$avg_logFC > 1.5 &
                                 ewsMarkerGenes$p_val_adj < 1E-50,]
+  
+  
   g1 <- ggplot(ewsMarkerGenes, mapping = aes_string(x = "avg_logFC", y = "pAdj",
                                                     color = "Marker")) +
     geom_point(size = .8) + theme_pubr(border = T, base_size = 22) +
@@ -553,6 +555,9 @@ if (! file.exists("Data/bulkRNASeq/pltDataUMAP_Fig1.rda")) {
          width = 10.64)
   
   # Marker genes analysis
+  ewsMarkerGenes2 <- ewsMarkerGenes[ewsMarkerGenes$Marker,]
+  ewsMarkerGenesFinal <- ewsMarkerGenes2[,c(7, 2, 1, 5)]
+  ewsMarkerGenesFinal <- ewsMarkerGenesFinal[order(ewsMarkerGenesFinal$avg_logFC, decreasing = TRUE),]
   marksNow <- ewsMarkerGenes$geneName
   marksNowTERM <- marksNow[which(marksNow %in% TERM2GENE_EWS$gene_symbol)]
   marksNowBIND <- marksNow[which(marksNow %in% TERM2GENE_EWS$gene_symbol[grep(x = TERM2GENE_EWS$gs_name, pattern = "TARGET|ACTIVATE|BOUND")])]
@@ -631,6 +636,7 @@ if (! file.exists("Data/bulkRNASeq/pltDataUMAP_Fig1.rda")) {
 if (! "vsd" %in% ls()) {
   load("Data/bulkRNASeq/fullVSTCounts.rda")
 }
+dir.create("Tables", showWarnings = FALSE)
 ewsMarkerGenes$p_val_adj[ewsMarkerGenes$p_val_adj == 0] <- .Machine$double.xmin
 ewingMarkers <- rownames(ewsMarkerGenes)[ewsMarkerGenes$avg_logFC > .58 &
                                            ewsMarkerGenes$p_val_adj < 1E-50]
