@@ -10,7 +10,7 @@ git clone https://github.com/millerh1/Ewing-sarcoma-paper-Miller-2020.git
 cd Ewing-sarcoma-paper-Miller-2020/
 conda env create -f environment.yml
 conda activate ewsPaperEnv
-(Rscript generateFigures.R) |& tee generateFigures_logFile.txt
+(Rscript generateFiguresV2.R) |& tee generateFigures_logFile.txt
 ```
 
 ## Additional details
