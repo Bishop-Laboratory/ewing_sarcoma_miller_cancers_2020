@@ -1,5 +1,5 @@
 # Processing scripts for Miller et al. 2020
-Repository of scripts and data for reproducing analysis in Miller et al. 2020
+Repository of scripts and data for reproducing analysis in [Miller et al. 2020](https://www.mdpi.com/2072-6694/12/4/948)
 
 ## Quickstart
 
