@@ -6,8 +6,8 @@ Repository of scripts and data for reproducing analysis in [Miller et al. 2020](
 Copy and paste the following code to recreate the paper's Conda environment and run all analyses:
 
 ```
-git clone https://github.com/millerh1/Ewing-sarcoma-paper-Miller-2020.git
-cd Ewing-sarcoma-paper-Miller-2020/
+git clone https://github.com/Bishop-Laboratory/ewing_sarcoma_miller_cancers_2020.git
+cd ewing_sarcoma_miller_cancers_2020/
 conda env create -f environment.yml
 conda activate ewsPaperEnv
 (Rscript generateFiguresV2.R) |& tee generateFigures_logFile.txt
